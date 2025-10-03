@@ -8,6 +8,7 @@ require (
 	github.com/onsi/ginkgo/v2 v2.23.4
 	github.com/onsi/gomega v1.38.0
 	github.com/spaolacci/murmur3 v1.1.0
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/net v0.43.0
 )
 

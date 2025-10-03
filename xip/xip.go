@@ -5,8 +5,11 @@ package xip
 
 import (
 	"bufio"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -15,9 +18,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -969,49 +972,83 @@ func isPrivateOrLoopback(ip net.IP) bool {
 	return ip.IsPrivate() || ip.IsLoopback()
 }
 
-var (
-	tokenMap = struct {
-		sync.RWMutex
-		m       map[uint32]TokenEntry // token → entry
-		reverse map[string]uint32     // "ip:port" → token
-	}{
-		m:       make(map[uint32]TokenEntry),
-		reverse: make(map[string]uint32),
-	}
-	tokenPool = make(chan uint32, 0xFFFFFF-1)
-)
-
 type TokenEntry struct {
 	IP        string
 	Port      int
 	ExpiresAt time.Time
 }
 
-func cleanupExpiredTokens() {
-	for {
-		time.Sleep(time.Minute)
-		now := time.Now()
+var (
+	db        *bolt.DB
+	tokenPool = make(chan uint32, 0xFFFFFF-1)
+)
 
-		tokenMap.Lock()
-		for k, v := range tokenMap.m {
-			if now.After(v.ExpiresAt) {
-				delete(tokenMap.m, k)
-				delete(tokenMap.reverse, v.IP+":"+strconv.Itoa(v.Port))
-				releaseToken(k) // 回收 token
-			}
-		}
-		tokenMap.Unlock()
+func init() {
+
+	// 打开 BoltDB
+	path := os.Getenv("TOKEN_STORE_PATH")
+	if path == "" {
+		path = "tokens.db"
 	}
+
+	initDB(path)
 }
 
-func monitorTokenMap() {
-	for {
-		time.Sleep(10 * time.Second)
-		tokenMap.RLock()
-		count := len(tokenMap.m)
-		tokenMap.RUnlock()
-		fmt.Printf("[monitor] tokenMap entries: %d\n", count)
+// 初始化数据库和 token 池
+func initDB(path string) {
+	var err error
+	db, err = bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		log.Fatalf("open boltdb: %v", err)
 	}
+
+	err = db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists([]byte("tokens")); err != nil {
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists([]byte("reverse")); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("init buckets: %v", err)
+	}
+
+	// 初始化 token 池
+	tokens := make([]uint32, 0, 0xFFFFFF-1)
+	for i := uint32(1); i < 0xFFFFFF; i++ {
+		tokens = append(tokens, i)
+	}
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := len(tokens) - 1; i > 0; i-- {
+		j := r.Intn(i + 1)
+		tokens[i], tokens[j] = tokens[j], tokens[i]
+	}
+	for _, t := range tokens {
+		tokenPool <- t
+	}
+
+	// 定期清理过期 token
+	go cleanupExpiredTokens()
+}
+
+func getFreeToken() uint32 {
+	return <-tokenPool
+}
+
+func releaseToken(tok uint32) {
+	tokenPool <- tok
+}
+
+func itob(v uint32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, v)
+	return b
+}
+
+func btoi(b []byte) uint32 {
+	return binary.BigEndian.Uint32(b)
 }
 
 func tokenToIP(tok uint32) [4]byte {
@@ -1021,40 +1058,167 @@ func tokenToIP(tok uint32) [4]byte {
 	return [4]byte{127, b1, b2, b3}
 }
 
-func init() {
-	// 初始化 token 池（排除 0x000000 和 0xFFFFFF）
-	// 先生成所有可用 token
-	tokens := make([]uint32, 0, 0xFFFFFF-1)
-	for i := uint32(1); i < 0xFFFFFF; i++ {
-		tokens = append(tokens, i)
-	}
+// 清理过期 token
+func cleanupExpiredTokens() {
+	for {
+		time.Sleep(30 * time.Minute)
+		now := time.Now()
+		_ = db.Update(func(tx *bolt.Tx) error {
+			b := tx.Bucket([]byte("tokens"))
+			r := tx.Bucket([]byte("reverse"))
 
-	// Fisher–Yates 洗牌
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i := len(tokens) - 1; i > 0; i-- {
-		j := r.Intn(i + 1)
-		tokens[i], tokens[j] = tokens[j], tokens[i]
+			c := b.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				var entry TokenEntry
+				if err := json.Unmarshal(v, &entry); err != nil {
+					continue
+				}
+				if now.After(entry.ExpiresAt) {
+					tok := btoi(k)
+					key := entry.IP + ":" + strconv.Itoa(entry.Port)
+					_ = b.Delete(k)
+					_ = r.Delete([]byte(key))
+					releaseToken(tok)
+				}
+			}
+			return nil
+		})
 	}
-
-	// 放入 channel
-	for _, t := range tokens {
-		tokenPool <- t
-	}
-
-	go cleanupExpiredTokens()
-	go monitorTokenMap()
 }
 
-func getFreeToken() uint32 {
-	return <-tokenPool // O(1) 从池子取
+// getOrCreateTokenForKey 做原子操作：
+// - 如果 reverse 中已有未过期 token -> 续期并返回它
+// - 否则 -> 原子写入新 token（事务内检查并处理并发）
+func getOrCreateTokenForKey(key, host string, port int, ttl time.Duration) (uint32, error) {
+	now := time.Now()
+
+	// 快速只读路径：先看有没有未过期的 token（避免不必要分配）
+	var quickTok uint32
+	var quickEntry TokenEntry
+	_ = db.View(func(tx *bolt.Tx) error {
+		rb := tx.Bucket([]byte("reverse"))
+		if rb == nil {
+			return nil
+		}
+		v := rb.Get([]byte(key))
+		if v == nil {
+			return nil
+		}
+		tok := btoi(v)
+		tb := tx.Bucket([]byte("tokens"))
+		if tb == nil {
+			return nil
+		}
+		val := tb.Get(itob(tok))
+		if val == nil {
+			return nil
+		}
+		if err := json.Unmarshal(val, &quickEntry); err != nil {
+			return nil
+		}
+		if now.Before(quickEntry.ExpiresAt) {
+			quickTok = tok
+		}
+		return nil
+	})
+	if quickTok != 0 {
+		// 续期（必须在写事务中）
+		quickEntry.ExpiresAt = now.Add(ttl)
+		err := db.Update(func(tx *bolt.Tx) error {
+			tb := tx.Bucket([]byte("tokens"))
+			if tb == nil {
+				return fmt.Errorf("tokens bucket missing")
+			}
+			v, _ := json.Marshal(quickEntry)
+			return tb.Put(itob(quickTok), v)
+		})
+		if err != nil {
+			return 0, err
+		}
+		return quickTok, nil
+	}
+
+	// 未命中快速路径 —— 需要尝试原子创建
+	allocated := getFreeToken() // 在事务外分配，失败时要释放回去
+	fmt.Printf("alloc: %d for %s\n", allocated, key)
+	allocatedUsed := false
+	var resultTok uint32
+
+	err := db.Update(func(tx *bolt.Tx) error {
+		tb := tx.Bucket([]byte("tokens"))
+		rb := tx.Bucket([]byte("reverse"))
+		if tb == nil || rb == nil {
+			return fmt.Errorf("buckets missing")
+		}
+
+		// 再次检查 reverse（事务内读到的才是最新）
+		v := rb.Get([]byte(key))
+		if v != nil {
+			existingTok := btoi(v)
+			val := tb.Get(itob(existingTok))
+			if val != nil {
+				var existingEntry TokenEntry
+				if err := json.Unmarshal(val, &existingEntry); err == nil {
+					if now.Before(existingEntry.ExpiresAt) {
+						// 并发已经创建了一个有效 token -> 续期并返回它
+						existingEntry.ExpiresAt = now.Add(ttl)
+						bb, _ := json.Marshal(existingEntry)
+						if err := tb.Put(itob(existingTok), bb); err != nil {
+							return err
+						}
+						resultTok = existingTok
+						allocatedUsed = false
+						return nil
+					}
+					// 存在但已过期 -> 我们复用 existingTok（避免产生新的 token）
+					newEntry := TokenEntry{IP: host, Port: port, ExpiresAt: now.Add(ttl)}
+					bb, _ := json.Marshal(newEntry)
+					if err := tb.Put(itob(existingTok), bb); err != nil {
+						return err
+					}
+					// reverse 已经映射到 existingTok，保持不变
+					resultTok = existingTok
+					allocatedUsed = false
+					return nil
+				}
+			}
+			// reverse 存在但 tokens 槽异常（val==nil 或 解析失败），直接覆盖它
+			// 这里也选择复用 existingTok（尽量保持 token 稳定），但为了简洁若无法解析则改写为 allocated token
+			// Fallthrough to using allocated token (下面会写入 allocated)
+		}
+
+		// 没有并发写入 -> 使用 allocated token 写入 tokens 和 reverse
+		newEntry := TokenEntry{IP: host, Port: port, ExpiresAt: now.Add(ttl)}
+		vv, _ := json.Marshal(newEntry)
+		if err := tb.Put(itob(allocated), vv); err != nil {
+			return err
+		}
+		if err := rb.Put([]byte(key), itob(allocated)); err != nil {
+			return err
+		}
+		resultTok = allocated
+		allocatedUsed = true
+		return nil
+	})
+
+	if err != nil {
+		// 事务失败的话要把 allocated 还回去，避免泄漏
+		releaseToken(allocated)
+		return 0, err
+	}
+
+	// 如果事务里没用到 allocated（即并发方先写入或复用 existing），把 allocated 放回池
+	if !allocatedUsed {
+		releaseToken(allocated)
+	}
+
+	return resultTok, nil
 }
 
-func releaseToken(tok uint32) {
-	tokenPool <- tok // 回收
-}
-
+// 将 NameToA 改为使用上面的原子函数
 func NameToA(fqdnString string, allowPublicIPs bool) []dnsmessage.AResource {
 	fqdnString = strings.ToLower(fqdnString)
+	// 如果你还有 Customizations 的逻辑，保留之
 	if domain, ok := Customizations[fqdnString]; ok && len(domain.A) > 0 {
 		return domain.A
 	}
@@ -1063,10 +1227,12 @@ func NameToA(fqdnString string, allowPublicIPs bool) []dnsmessage.AResource {
 	if match == nil {
 		return nil
 	}
-
 	host := match[1]
 	portStr := match[2]
 
+	if !isValidHostPrefix(host) {
+		return nil
+	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
 		return nil
@@ -1074,103 +1240,51 @@ func NameToA(fqdnString string, allowPublicIPs bool) []dnsmessage.AResource {
 
 	key := host + ":" + strconv.Itoa(port)
 
-	tokenMap.Lock()
-	defer tokenMap.Unlock()
-
-	// 复用
-	if tok, ok := tokenMap.reverse[key]; ok {
-		entry := tokenMap.m[tok]
-		entry.ExpiresAt = time.Now().Add(60 * time.Minute)
-		tokenMap.m[tok] = entry
-		return []dnsmessage.AResource{{A: tokenToIP(tok)}}
+	// 使用原子化的 helper 获取或创建 token（并自动续期）
+	tok, err := getOrCreateTokenForKey(key, host, port, 24*time.Hour)
+	if err != nil {
+		// 记录错误但不崩溃
+		fmt.Printf("getOrCreateTokenForKey error: %v\n", err)
+		return nil
 	}
-
-	// 新分配
-	tok := getFreeToken()
-	fmt.Printf("alloc: %d for %s\n", tok, key)
-	tokenMap.m[tok] = TokenEntry{
-		IP:        host,
-		Port:      port,
-		ExpiresAt: time.Now().Add(60 * time.Minute),
-	}
-	tokenMap.reverse[key] = tok
 
 	return []dnsmessage.AResource{{A: tokenToIP(tok)}}
 }
 
-//TODO 需要用tokenPool
-// func NameToA_OnlyIPv4(fqdnString string, allowPublicIPs bool) []dnsmessage.AResource {
-// 	fqdn := []byte(fqdnString)
+// 判断 host 合法性
+func isValidHostPrefix(s string) bool {
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.To4() != nil
+	}
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
 
-// 	if domain, ok := Customizations[strings.ToLower(fqdnString)]; ok && len(domain.A) > 0 {
-// 		return domain.A
-// 	}
+// 从 BoltDB 查 token → TokenEntry
+func getTokenEntry(tok uint32) (TokenEntry, bool) {
+	var entry TokenEntry
+	found := false
 
-// 	if match := ipv4PortRE.FindSubmatch(fqdn); match != nil {
-// 		ipStr := string(match[2])
-// 		portStr := string(match[3])
-
-// 		port, err := strconv.Atoi(portStr)
-// 		if err != nil || port < 1 || port > 65535 {
-// 			return nil
-// 		}
-
-// 		parsed := net.ParseIP(ipStr)
-// 		if parsed == nil {
-// 			return nil
-// 		}
-// 		ip4 := parsed.To4()
-// 		if ip4 == nil {
-// 			return nil
-// 		}
-
-// 		if !isPrivateOrLoopback(ip4) {
-// 			return nil
-// 		}
-
-// 		key := ipStr + ":" + strconv.Itoa(port)
-
-// 		tokenMap.Lock()
-// 		defer tokenMap.Unlock()
-
-// 		// O(1) 查是否已存在 token
-// 		if tok, ok := tokenMap.reverse[key]; ok {
-// 			entry := tokenMap.m[tok]
-// 			entry.ExpiresAt = time.Now().Add(10 * time.Minute)
-// 			tokenMap.m[tok] = entry
-
-// 			b1 := byte((tok >> 16) & 0xFF)
-// 			b2 := byte((tok >> 8) & 0xFF)
-// 			b3 := byte(tok & 0xFF)
-// 			return []dnsmessage.AResource{{A: [4]byte{127, b1, b2, b3}}}
-// 		}
-
-// 		// 生成新 token
-// 		var tok uint32
-// 		for {
-// 			tok = rand.Uint32() & 0x00FFFFFF
-// 			if _, exists := tokenMap.m[tok]; !exists {
-// 				break
-// 			}
-// 		}
-
-// 		// 保存到双索引
-// 		tokenMap.m[tok] = TokenEntry{
-// 			IP:        ipStr,
-// 			Port:      port,
-// 			ExpiresAt: time.Now().Add(10 * time.Minute),
-// 		}
-// 		tokenMap.reverse[key] = tok
-
-// 		b1 := byte((tok >> 16) & 0xFF)
-// 		b2 := byte((tok >> 8) & 0xFF)
-// 		b3 := byte(tok & 0xFF)
-
-// 		return []dnsmessage.AResource{{A: [4]byte{127, b1, b2, b3}}}
-// 	}
-
-// 	return nil
-// }
+	err := db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("tokens"))
+		v := b.Get(itob(tok))
+		if v == nil {
+			return nil
+		}
+		if err := json.Unmarshal(v, &entry); err == nil {
+			found = true
+		}
+		return nil
+	})
+	if err != nil {
+		return TokenEntry{}, false
+	}
+	return entry, found
+}
 
 func NameToCNAME(fqdnString string) *dnsmessage.CNAMEResource {
 	fqdnString = strings.ToLower(fqdnString)
@@ -1192,10 +1306,7 @@ func NameToCNAME(fqdnString string) *dnsmessage.CNAMEResource {
 	tokenVal := uint32(b1)<<16 | uint32(b2)<<8 | uint32(b3)
 
 	// 查表
-	tokenMap.RLock()
-	entry, ok := tokenMap.m[tokenVal]
-	tokenMap.RUnlock()
-
+	entry, ok := getTokenEntry(tokenVal)
 	if !ok {
 		return nil
 	}
@@ -1225,10 +1336,7 @@ func NameToTXT(fqdnString string) []dnsmessage.TXTResource {
 	tokenVal := uint32(b1)<<16 | uint32(b2)<<8 | uint32(b3)
 
 	// 查表
-	tokenMap.RLock()
-	entry, ok := tokenMap.m[tokenVal]
-	tokenMap.RUnlock()
-
+	entry, ok := getTokenEntry(tokenVal)
 	if !ok {
 		return nil
 	}

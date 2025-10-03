@@ -1,4 +1,4 @@
-set app=sslip
+set app=listtokens
 
 set HTTP_PROXY=http://127.0.0.1:58080
 set HTTPS_PROXY=http://127.0.0.1:58080
