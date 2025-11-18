@@ -223,8 +223,12 @@ type Response struct {
 	Additionals []func(*dnsmessage.Builder) error
 }
 
-// NewXip follows convention for constructors: https://go.dev/doc/effective_go#allocation_new
 func NewXip(blocklistURL string, nameservers []string, addresses []string, delegates []string, ptrDomain string) (x *Xip, logmessages []string) {
+	return NewXip2(blocklistURL, nameservers, addresses, delegates, nil, ptrDomain)
+}
+
+// NewXip follows convention for constructors: https://go.dev/doc/effective_go#allocation_new
+func NewXip2(blocklistURL string, nameservers []string, addresses []string, delegates []string, cnames []string, ptrDomain string) (x *Xip, logmessages []string) {
 	x = &Xip{Metrics: Metrics{Start: time.Now()}}
 
 	// Download the blocklist
@@ -338,6 +342,48 @@ func NewXip(blocklistURL string, nameservers []string, addresses []string, deleg
 		Customizations[delegatedDomain] = domainEntry
 		// print out the added records in a manner similar to the way they're set on the cmdline
 		logmessages = append(logmessages, fmt.Sprintf(`Adding delegated NS record "%s=%s"`, delegatedDomain, nsName.String()))
+	}
+
+	for _, cname := range cnames {
+		if len(cname) == 0 {
+			logmessages = append(logmessages, `-cnames: ignoring zero-length cname ""`)
+			continue
+		}
+
+		hostAddr := strings.Split(cname, "=")
+		if len(hostAddr) != 2 {
+			logmessages = append(logmessages, fmt.Sprintf(`-cnames: arguments should be in the format "cname=domain", not "%s"`, cname))
+			continue
+		}
+
+		host := hostAddr[0]
+		target := hostAddr[1]
+
+		// ensure absolute names
+		if host[len(host)-1] != '.' {
+			host += "."
+		}
+		if target[len(target)-1] != '.' {
+			target += "."
+		}
+
+		// validate CNAME target
+		cnameName, err := dnsmessage.NewName(target)
+		if err != nil {
+			logmessages = append(logmessages,
+				fmt.Sprintf(`-cnames: ignoring invalid CNAME target "%s"`, target))
+			continue
+		}
+
+		// append into Customizations
+		entry := DomainCustomization{}
+		if exist, ok := Customizations[host]; ok {
+			entry = exist
+		}
+		entry.CNAME = dnsmessage.CNAMEResource{CNAME: cnameName}
+		Customizations[host] = entry
+
+		logmessages = append(logmessages, fmt.Sprintf(`Adding cname "%s=%s"`, host, target))
 	}
 
 	// We want to make sure that our DNS server isn't used in a DNS amplification attack.
@@ -715,22 +761,32 @@ func (x *Xip) processQuestion(q dnsmessage.Question, srcAddr net.IP) (response R
 			RCode:              dnsmessage.RCodeSuccess, // assume success, may be replaced later
 		},
 	}
-	if IsDelegated(q.Name.String()) {
-		// if xip.pivotal.io has been delegated to ns-437.awsdns-54.com.
-		// and a query comes in for 127-0-0-1.cloudfoundry.xip.pivotal.io
-		// then don't resolve the A record; instead, return the delegated
-		// NS record, ns-437.awsdns-54.com.
-		response.Header.Authoritative = false
-		return x.NSResponse(q.Name, response, logMessage)
+
+	QType := q.Type
+
+	fqdnString := strings.ToLower(q.Name.String())
+	// 如果你还有 Customizations 的逻辑，保留之
+	if domain, ok := Customizations[fqdnString]; ok && domain.CNAME.CNAME.Length > 0 {
+		QType = dnsmessage.TypeCNAME
+	} else {
+		if IsDelegated(q.Name.String()) {
+			// if xip.pivotal.io has been delegated to ns-437.awsdns-54.com.
+			// and a query comes in for 127-0-0-1.cloudfoundry.xip.pivotal.io
+			// then don't resolve the A record; instead, return the delegated
+			// NS record, ns-437.awsdns-54.com.
+			response.Header.Authoritative = false
+			return x.NSResponse(q.Name, response, logMessage)
+		}
+		if IsAcmeChallenge(q.Name.String()) && !x.blocklist(q.Name.String()) {
+			// thanks, @NormanR
+			// delegate everything to its stripped (remove "_acme-challenge.") address, e.g.
+			// dig _acme-challenge.127-0-0-1.sslip.io mx → NS 127-0-0-1.sslip.io
+			response.Header.Authoritative = false
+			return x.NSResponse(q.Name, response, logMessage)
+		}
 	}
-	if IsAcmeChallenge(q.Name.String()) && !x.blocklist(q.Name.String()) {
-		// thanks, @NormanR
-		// delegate everything to its stripped (remove "_acme-challenge.") address, e.g.
-		// dig _acme-challenge.127-0-0-1.sslip.io mx → NS 127-0-0-1.sslip.io
-		response.Header.Authoritative = false
-		return x.NSResponse(q.Name, response, logMessage)
-	}
-	switch q.Type {
+
+	switch QType {
 	case dnsmessage.TypeA:
 		{
 			return x.nameToAwithBlocklist(q, response, logMessage)
@@ -979,6 +1035,7 @@ type TokenEntry struct {
 }
 
 var (
+	InitDBOK  = false
 	db        *bolt.DB
 	tokenPool = make(chan uint32, 0xFFFFFF-1)
 )
@@ -999,7 +1056,8 @@ func initDB(path string) {
 	var err error
 	db, err = bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
 	if err != nil {
-		log.Fatalf("open boltdb: %v", err)
+		log.Printf("open boltdb: %v\n", err)
+		return
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
@@ -1012,7 +1070,8 @@ func initDB(path string) {
 		return nil
 	})
 	if err != nil {
-		log.Fatalf("init buckets: %v", err)
+		log.Printf("init buckets: %v\n", err)
+		return
 	}
 
 	// 初始化 token 池
@@ -1031,6 +1090,7 @@ func initDB(path string) {
 
 	// 定期清理过期 token
 	go cleanupExpiredTokens()
+	InitDBOK = true
 }
 
 func getFreeToken() uint32 {

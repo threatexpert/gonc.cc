@@ -67,12 +67,17 @@ func main() {
 	var quiet = flag.Bool("quiet", false, "suppresses logging of each DNS response. Use this to avoid Google Cloud charging you $30/month to retain the logs of your GKE-based sslip.io server")
 	var public = flag.Bool("public", true, "allows resolution of public IP addresses. If false, only resolves private IPs including localhost (127/8, ::1), link-local (169.254/16, fe80::/10), CG-NAT (100.64/12), private (10/8, 172.16/12, 192.168/16, fc/7). Set to false if you don't want miscreants impersonating you via public IPs. If unsure, set to false")
 	var ptrDomain = flag.String("ptr-domain", "nip.io.", "the domain to use for PTR records, e.g. if 'nip.io',  127-0-0-1.nip.io.")
+	var cnames = flag.String("cnames", "", "comma-separated list of CNAME records to add.")
+
 	flag.Parse()
 	log.Printf("%s version %s starting", os.Args[0], xip.VersionSemantic)
+	if !xip.InitDBOK {
+		return
+	}
 	log.Printf("blocklist URL: %s, name servers: %s, bind port: %d, quiet: %t",
 		*blocklistURL, *nameservers, *bindPort, *quiet)
 
-	x, logmessages := xip.NewXip(*blocklistURL, strings.Split(*nameservers, ","), strings.Split(*addresses, ","), strings.Split(*delegates, ","), *ptrDomain)
+	x, logmessages := xip.NewXip2(*blocklistURL, strings.Split(*nameservers, ","), strings.Split(*addresses, ","), strings.Split(*delegates, ","), strings.Split(*cnames, ","), *ptrDomain)
 	x.Public = *public
 	for _, logmessage := range logmessages {
 		log.Println(logmessage)
