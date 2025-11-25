@@ -1020,13 +1020,13 @@ func buildNSRecords(b *dnsmessage.Builder, name dnsmessage.Name, nameServers []d
 // 	return []dnsmessage.AResource{}
 // }
 
-func isPrivateOrLoopback(ip net.IP) bool {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
-	}
-	return ip.IsPrivate() || ip.IsLoopback()
-}
+// func isPrivateOrLoopback(ip net.IP) bool {
+// 	ip4 := ip.To4()
+// 	if ip4 == nil {
+// 		return false
+// 	}
+// 	return ip.IsPrivate() || ip.IsLoopback()
+// }
 
 type TokenEntry struct {
 	IP        string
@@ -1074,9 +1074,32 @@ func initDB(path string) {
 		return
 	}
 
+	// 先读取数据库中已有的所有 Token
+	existingTokens := make(map[uint32]bool)
+	err = db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("tokens"))
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			existingTokens[btoi(k)] = true
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("read existing tokens: %v", err)
+		return
+	}
+
+	log.Printf("Found %d existing tokens in DB", len(existingTokens))
+
 	// 初始化 token 池
 	tokens := make([]uint32, 0, 0xFFFFFF-1)
 	for i := uint32(1); i < 0xFFFFFF; i++ {
+		if existingTokens[i] {
+			continue
+		}
 		tokens = append(tokens, i)
 	}
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -1119,30 +1142,79 @@ func tokenToIP(tok uint32) [4]byte {
 }
 
 // 清理过期 token
+// ---------------------------------------------------------
+// 【性能优化 2】分批清理，避免长事务锁死 DB
+// ---------------------------------------------------------
+type expiredItem struct {
+	tok uint32
+	key string
+}
+
 func cleanupExpiredTokens() {
 	for {
 		time.Sleep(30 * time.Minute)
 		now := time.Now()
-		_ = db.Update(func(tx *bolt.Tx) error {
+
+		var toDelete []expiredItem
+
+		// 第一步：使用 View (只读事务) 快速查找过期项
+		// View 事务不会阻塞其他 View，也不会阻塞 Update 的排队（Update 优于 View）
+		// 但长 View 会阻碍 Update 开始，所以这里只做内存收集
+		_ = db.View(func(tx *bolt.Tx) error {
 			b := tx.Bucket([]byte("tokens"))
-			r := tx.Bucket([]byte("reverse"))
+			if b == nil {
+				return nil
+			}
 
 			c := b.Cursor()
 			for k, v := c.First(); k != nil; k, v = c.Next() {
 				var entry TokenEntry
+				// 注意：这里做 Unmarshal 消耗 CPU，放在 View 里比 Update 里好，
+				// 但数据量极大时仍有优化空间（如自定义二进制格式）
 				if err := json.Unmarshal(v, &entry); err != nil {
 					continue
 				}
 				if now.After(entry.ExpiresAt) {
 					tok := btoi(k)
 					key := entry.IP + ":" + strconv.Itoa(entry.Port)
-					_ = b.Delete(k)
-					_ = r.Delete([]byte(key))
-					releaseToken(tok)
+					toDelete = append(toDelete, expiredItem{tok: tok, key: key})
 				}
 			}
 			return nil
 		})
+
+		if len(toDelete) == 0 {
+			continue
+		}
+
+		log.Printf("Cleaning up %d expired tokens...", len(toDelete))
+
+		// 第二步：分批删除 (避免一次锁定太久)
+		batchSize := 1000
+		for i := 0; i < len(toDelete); i += batchSize {
+			end := i + batchSize
+			if end > len(toDelete) {
+				end = len(toDelete)
+			}
+
+			_ = db.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket([]byte("tokens"))
+				r := tx.Bucket([]byte("reverse"))
+
+				for j := i; j < end; j++ {
+					item := toDelete[j]
+					// 删除
+					_ = b.Delete(itob(item.tok))
+					_ = r.Delete([]byte(item.key))
+					// 放回池子
+					releaseToken(item.tok)
+				}
+				return nil
+			})
+
+			// 每一批删除后，稍微睡一下，让出锁给正常的请求（这非常重要）
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 }
 
