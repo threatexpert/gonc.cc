@@ -841,10 +841,13 @@ func (x *Xip) processQuestion(q dnsmessage.Question, srcAddr net.IP) (response R
 				})
 			return response, logMessage + cname.CNAME.String(), nil
 		}
-	case dnsmessage.TypeMX:
+
+	case dnsmessage.TypeMX, 257: //CAA
 		{
-			response.Header.RCode = dnsmessage.RCodeNotImplemented
-			return response, logMessage + "NotImplemented", nil
+			// 显式设为 Success，表示服务器运行正常，只是该域名没有这条记录
+			response.Header.RCode = dnsmessage.RCodeSuccess
+			// 保持 response.Answers 为空，不添加任何资源记录
+			return response, logMessage + "NODATA (Success)", nil
 		}
 	case dnsmessage.TypeNS:
 		{
